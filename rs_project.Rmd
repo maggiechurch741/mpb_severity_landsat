@@ -1,0 +1,735 @@
+---
+title: "rs_project"
+output: html_document
+date: "2023-11-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=F message=F}
+library(dplyr)
+library(readxl)
+library(sf) # replaces "sp", used for vector
+library(terra) # replaces "raster"
+library(R.utils)
+library(ggplot2)
+library(tidyr)
+library(cowplot)
+library(randomForest)
+library(yardstick)
+#library(RStoolbox)
+
+# define projection for project
+NAD83_UTM13 <- "EPSG:6342"
+```
+
+# Read in field data and W. RMNP boundary
+```{r}
+# read in ground-truth data
+raw <- read_excel("field_data/DATA.xlsx", sheet = "point info")
+metrics <- read.csv("field_data/mpb_severity_metrics_perovich.csv")
+df <- inner_join(raw, metrics, by=c("Site"="PLOT.ID"))
+
+# convert to vector points
+df_sf <- st_as_sf(df, coords=c("X", "Y"), crs=NAD83_UTM13)
+
+# read in the shape file representing the region of interest for clipping the data
+extent_wrmnp <- read_sf("rmnp_boundary/qgis_layers/rmnp_west_side/rmnp_west_side.shp")
+
+# read in the shape file representing the area of prediction (pico forest)
+romo_veg_map <- read_sf("romo_veg_map/veg_map_utm/veg_map_utm.shp") 
+```
+
+```{r}
+# try another y-var
+
+# % dead ba (all spp, all ages) <- rodman
+trees1 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4) %>%
+  mutate(dead = if_else(STATUS %in% c(3,5), 1, 0)) %>%
+  group_by(`PLOT ID`, dead) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarize(dead_ba_percent = ba[dead==1]/sum(ba)*100) %>%
+  ungroup()
+
+# % dead ba (all spp, adults)
+trees2 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4 & DBH > 5) %>%
+  mutate(dead = if_else(STATUS %in% c(3,5), 1, 0)) %>%
+  group_by(`PLOT ID`, dead) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarise(dead_ad_ba_percent = ba[dead==1]/sum(ba)*100) %>%
+  ungroup()
+
+#3 % dead or MPB ba (all spp, any age)
+trees3 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4) %>%
+  mutate(dead_or_mpb = if_else(STATUS %in% c(3,5) | MPB == 1, 1, 0)) %>%
+  group_by(`PLOT ID`, dead_or_mpb) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarize(dead_or_mpb_ba_percent = ba[dead_or_mpb==1]/sum(ba)*100) %>%
+  ungroup()
+
+#4 % dead or MPB ba (all spp, adults)
+trees4 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4 & DBH > 5) %>%
+  mutate(dead_or_mpb = if_else(STATUS %in% c(3,5) | MPB == 1, 1, 0)) %>%
+  group_by(`PLOT ID`, dead_or_mpb) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarize(dead_or_mpb_ad_ba_percent = ba[dead_or_mpb==1]/sum(ba)*100) %>%
+  ungroup()
+
+trees5 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4) %>%
+  mutate(dead = if_else(STATUS %in% c(2,3,5), 1, 0)) %>%
+  group_by(`PLOT ID`, dead) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarize(dead_or_unhealthy_ba_percent = ba[dead==1]/sum(ba)*100) %>%
+  ungroup()
+
+# % dead ba (all spp, adults)
+trees6 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4 & DBH > 5) %>%
+  mutate(dead = if_else(STATUS %in% c(2,3,5), 1, 0)) %>%
+  group_by(`PLOT ID`, dead) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarise(dead_or_unhealthy_ad_ba_percent = ba[dead==1]/sum(ba)*100) %>%
+  ungroup()
+
+#3 % dead or MPB ba (all spp, any age)
+trees7 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4) %>%
+  mutate(dead_or_mpb = if_else(STATUS %in% c(2,3,5) | MPB == 1, 1, 0)) %>%
+  group_by(`PLOT ID`, dead_or_mpb) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarize(dead_or_unhealthy_or_mpb_ba_percent = ba[dead_or_mpb==1]/sum(ba)*100) %>%
+  ungroup()
+
+#4 % dead or MPB ba (all spp, adults)
+trees8 <- 
+  read_excel("field_data/DATA.xlsx", sheet = "trees") %>%
+  filter(STATUS != 4 & DBH > 5) %>%
+  mutate(dead_or_mpb = if_else(STATUS %in% c(2,3,5) | MPB == 1, 1, 0)) %>%
+  group_by(`PLOT ID`, dead_or_mpb) %>%
+  dplyr::summarize(ba = sum(DBH^2 * 0.005454)) %>%
+  ungroup() %>% 
+  group_by(`PLOT ID`) %>% 
+  dplyr::summarize(dead_or_unhealthy_or_mpb_ad_ba_percent = ba[dead_or_mpb==1]/sum(ba)*100) %>%
+  ungroup()
+
+df <- 
+  df %>%
+  inner_join(trees1, by=c("Site"="PLOT ID")) %>%
+  inner_join(trees2, by=c("Site"="PLOT ID")) %>%
+    inner_join(trees3, by=c("Site"="PLOT ID")) %>%
+    inner_join(trees4, by=c("Site"="PLOT ID")) %>%
+    inner_join(trees5, by=c("Site"="PLOT ID")) %>%
+    inner_join(trees6, by=c("Site"="PLOT ID")) %>%
+    inner_join(trees7, by=c("Site"="PLOT ID")) %>%
+    inner_join(trees8, by=c("Site"="PLOT ID"))
+
+
+```
+
+# function to geoprocess landsat images
+```{r}
+process_landsat <- function(filepath, filename_prefix){
+    
+  # get filenames
+  filenames <- paste0(filepath, filename_prefix, "_SR_B", c(1:5,7), ".TIF")
+  qa_filename <- paste0(filepath, filename_prefix, "_QA_PIXEL.TIF")
+  
+  # read in spectral bands and QA layer
+  L <- terra::rast(filenames)
+  names(L) <- c('blue', 'green', 'red', 'NIR', 'SWIR1', 'SWIR2') 
+  L_qa <- terra::rast(qa_filename)
+  names(L_qa) <- "qa"
+  
+  # set buffer, to speed up reprojection in next step
+  buff <- buffer(vect(extent_wrmnp), 10000) 
+  
+  # geoprocess SR bands
+  L <- 
+    crop(L, buff) %>%         # clip image to speed up reprojection
+    project(NAD83_UTM13) %>%  # reproject
+    mask(extent_wrmnp)        # crop to the ROI
+  
+  # more geoprocessing...  
+  L <- 
+    (L * 0.0000275 - 0.2) %>%
+    clamp(0, 1) 
+
+  # geoprocess qa raster
+  L_qa <-
+    crop(L_qa, buff) %>%      # clip image to speed up reprojection
+    project(NAD83_UTM13) %>%  # reproject
+    mask(extent_wrmnp)        # crop to the ROI
+  
+  # QA_PIXEL is generated by the CFMask algorithm. Get values to be masked:
+  cloud_dilations <- bitwAnd(L_qa[], 2^1) > 0  # bit1=cloud dilation
+  clouds <- bitwAnd(L_qa[], 2^3) > 0           # bit3=clouds
+  cloud_shadows <- bitwAnd(L_qa[], 2^4) > 0    # bit4=clouds
+  
+  # assign non-pico pixels to NA in landsat image
+  L_qa[cloud_dilations] <- NA
+  L_qa[clouds] <- NA
+  L_qa[cloud_shadows] <- NA 
+  
+  # mask out clouds in imagery bands
+  L_clear <- mask(L, L_qa)
+  
+  # return L_clear
+  L_clear
+}  
+```
+
+# Read and geoprocess landsat images
+```{r, eval=F}
+
+######################
+# 2009 L5 image
+post <- process_landsat(filepath="landsat/L5_20090821/", 
+                        filename_prefix="LT05_L2SP_034032_20090821_20200827_02_T1")
+
+# 2010 L5 image
+post <- process_landsat(filepath="landsat/L5_20100925/", 
+                        filename_prefix="LT05_L2SP_034032_20100925_20200823_02_T1")
+
+# 2009 L5 image
+post <- process_landsat(filepath="landsat/L5_20090821/", 
+                        filename_prefix="LT05_L2SP_034032_20090821_20200827_02_T1")
+
+# 2000 L5 image
+pre <- process_landsat(filepath="landsat/L5_20000913/", 
+                        filename_prefix="LT05_L2SP_034032_20000913_20200906_02_T1")
+
+# 1998 L5 image
+pre <- process_landsat(filepath="landsat/L5_19980908/", 
+                        filename_prefix="LT05_L2SP_034032_19980908_20200908_02_T1")
+```
+```{r}
+######
+# 100% cloud-free - performs best
+post_date <- "9/17/2010"
+post <- process_landsat(filepath="landsat/L7_20100917/",  filename_prefix="LE07_L2SP_034032_20100917_20200910_02_T1")
+
+# 99% cloud-free - performs best
+pre_date <- "8/2/1999"
+pre <- process_landsat(filepath="landsat/L7_19990802/",   filename_prefix="LE07_L2SP_034032_19990802_20200918_02_T1")
+
+# 100% clear - SWIR bands are really correlated, but probably deflated bc of springtime moisture. 
+#post_date <- "6/18/2012"
+#post <- process_landsat(filepath="landsat/L7_20120618/",  filename_prefix="LE07_L2SP_034032_20120618_20200908_02_T1")
+
+# 99% cloud-free
+#post_date <- "9/9/2007"
+#post <- process_landsat(filepath="landsat/L7_20070909/",  filename_prefix="LE07_L2SP_034032_20070909_20200913_02_T1")
+
+# 93% cloud-free
+#pre_date <- "7/19/2000"
+#pre <- process_landsat(filepath="landsat/L7_20000719/", filename_prefix="LE07_L2SP_034032_20000719_20200918_02_T1")
+
+# 87% cloud-free
+#post_date <- "7/15/2010"
+#post <- process_landsat(filepath="landsat/L7_20100715/", filename_prefix="LE07_L2SP_034032_20100715_20200911_02_T1")
+
+# 95% cloud-free 
+#pre_date <- "8/18/1999"
+#pre <- process_landsat(filepath="landsat/L7_19990818/",filename_prefix="LE07_L2SP_034032_19990818_20200918_02_T1")
+
+#pre_date <- "6/23/2002"
+#pre <- process_landsat(filepath="landsat/L7_20020623/",filename_prefix="LE07_L2SP_034032_20020623_20200916_02_T1")
+
+#post_date <- "7/15/2010"
+#post <- process_landsat(filepath="landsat/L7_20100715/", filename_prefix="LE07_L2SP_034032_20100715_20200911_02_T1")
+
+```
+
+# Get PICO forest in W. RMNP. This the area we'll predict over
+```{r}
+# geoprocess ROMO veg map to get a raster of pico forests in our ROI
+pico_rast <- 
+  romo_veg_map %>%
+  filter(COMMON_MAP %in% c(
+    'Lodgepole Pine - Low Elevation < 9500 ft', 
+    'Lodgepole Pine - High Elevation > 9500 ft', 
+    'Lodgepole Pine - Rock')) %>%  
+  rasterize(y=post$NIR) %>%   # shouldn't matter which landsat image I use
+  mask(extent_wrmnp)          # crop to the ROI
+
+# clip landsat to pico stands only
+post_pico <-  mask(post, pico_rast)  
+pre_pico <- mask(pre, pico_rast)
+
+# plot for funsies (true color)
+plotRGB(pre_pico, b=1, g=2, r=3, stretch="hist") 
+plotRGB(post_pico, b=1, g=2, r=3, stretch="hist") 
+
+# false color
+plotRGB(pre_pico, b=2, g=4, r=5, stretch="hist") 
+plotRGB(post_pico, b=2, g=4, r=5, stretch="hist") 
+
+# total pico area
+area_pico <- length(pico_rast[!is.na(pico_rast)])*30^2/1000^2  
+
+# % cloudless (I can only do this on one band, so I arbitrarily chose NIR)
+length(pre_pico$NIR[!is.na(pre_pico$NIR)])*30^2/1000^2/area_pico*100  # pre
+length(post_pico$NIR[!is.na(post_pico$NIR)])*30^2/1000^2/area_pico*100  # post
+```
+
+
+# Extract SR values to field points. These are the points we'll train on
+```{r}
+
+# plot field points over prediction area
+plotRGB(pre_pico, b=1, g=2, r=3, stretch="hist") 
+points(df_sf, col="red", cex=1)
+
+
+# functionalize...
+sr_to_points <- function(rast){
+
+    # convert field points to spatvector
+    df_vect <- vect(df_sf)
+
+    # extract spectral reflectance for each field point
+    terra::extract(rast, df_vect, method="bilinear") %>% # use 4 nearest raster cells
+    bind_cols(df) %>%
+    select(dead_or_mpb_ba_percent, blue:SWIR2) %>%
+    filter_all(all_vars(!is.na(.))) 
+}
+
+post_points <- sr_to_points(post) 
+pre_points <- sr_to_points(pre) 
+
+
+```
+
+```{r}
+# quantify cloud cover of field points
+points_clear <- function(points_df){
+  
+  # total field points 
+  all_points <- length(vect(df_sf))  # 219 plots
+  
+  # cloudless field points (arbitrarily chose NIR)
+  cloudless_points <- 
+    points_df %>%
+    filter(NIR != "NaN") %>%
+    count() %>%
+    pull()
+  
+  # % of points that are cloudless
+  cloudless_points/all_points*100 
+}
+
+points_clear(post_points)
+points_clear(pre_points)
+```
+# determine classification cutoff
+```{r}
+kmeans_clusters <- kmeans(post_points$dead_or_mpb_ba_percent, centers = 3)
+
+# classify low-med-high MPB severity
+post_points$mpb_severity <- kmeans_clusters$cluster
+
+#post_points <- 
+ # post_points %>%
+ # mutate(mpb_severity = case_when(mpb_severity == 1 ~ "low",
+ #                                 mpb_severity == 2 ~ "med",
+ #                                 mpb_severity == 3 ~ "high")) %>%
+ # mutate(mpb_severity = case_when(mpb_ba_percent < 60 ~ "low",
+#                                  mpb_ba_percent >= 60 & mpb_ba_percent <= 80 ~ "med",
+#                                  mpb_ba_percent > 80 ~ "high")) %>%
+#  mutate(mpb_severity = factor(mpb_severity, levels=c("low","med","high")))
+  
+post_points <- 
+  post_points %>%
+  mutate(mpb_severity = case_when(dead_or_mpb_ba_percent <= 59.4 ~ "low",
+                                  dead_or_mpb_ba_percent > 59.4 & dead_or_mpb_ba_percent <= 79.9 ~ "med",
+                                  dead_or_mpb_ba_percent > 79.9 ~ "high")) %>%
+  mutate(mpb_severity = factor(mpb_severity, levels=c("low","med","high")))
+
+
+# apply to pre_points (this'll drop the points that are masked out of post_points)
+num_cat_xwalk <- 
+  post_points %>% 
+  select(dead_or_mpb_ba_percent, mpb_severity) %>%
+  distinct() 
+
+pre_points <- inner_join(pre_points, num_cat_xwalk, by = 'dead_or_mpb_ba_percent')
+
+
+```
+
+
+# Plot spectral signatures
+```{r}
+# plot spectral signatures
+# get band values for field points (df_sr = output of sr_to_points)
+plot_spectral_sig <- function(df_sr, title){
+  
+ # set band order
+ band_order <- c("blue", "green", "red", "NIR", "SWIR1", "SWIR2")
+ 
+   df_sr %>%
+   pivot_longer(cols=blue:SWIR2, names_to="band") %>%
+   mutate(band = factor(band, levels=band_order))  %>%
+   ggplot(aes(x=band, y=value, fill=mpb_severity)) +
+   geom_boxplot() +
+    ylim(0,.2) +
+    labs(y="Reflectance",
+        title=title) 
+}
+
+p_post <- plot_spectral_sig(post_points, title=paste("Post-Outbreak", post_date))
+p_pre <- plot_spectral_sig(pre_points, title=paste("Pre-Outbreak", pre_date))
+
+plot_grid(p_pre, p_post, ncol=1)
+```
+
+
+```{r}
+# do a boxplot of the difference, fill by mpb_severity
+
+plot_spectral_sig_diff <- function(df_sr_pre, df_sr_post, title){
+  
+ # set band order
+ band_order <- c("blue", "green", "red", "NIR", "SWIR1", "SWIR2")
+ 
+   df_sr_pre %>%
+   pivot_longer(cols=blue:SWIR2, names_to="band") %>%
+   mutate(band = factor(band, levels=band_order))  %>%
+   ggplot(aes(x=band, y=value, fill=mpb_severity)) +
+   geom_boxplot() +
+    ylim(0,.2) +
+    labs(y="Reflectance",
+        title=title) 
+}
+```
+
+interesting, the pre-outbreak green is lower...maybe there's recovery in the post-outbreak image? Also, why are trees already separated in SWIR in the pre-outbreak. Drought?  
+
+Remember:
+* SWIR captures leaf moisture (lower = moister) Recent precip can affect this
+* Foliage reflects NIR (to avoid overheating), though conifers reflect less
+* Chlorophyll reflects green 
+
+from 1999 to 2000 to 2002, we see increasingly more RBG (??), less NIR (less foliage), and more SWIR (droughtier)
+from 2010 to 2012, we see more reflectance in all bands. More foliage, droughtier...? we do see a better separation between outbreak severities in 2010 than 2012
+
+- NDMI between 0 and -0.20: low canopy cover or low moisture content
+- NDMI values vary throughout the growing season because the plants’ reflectance is slightly different for every phenological stage (not sure how true this is for conifers). 
+- There also exists an interesting correlation between NDMI and NDVI. Water stress indicated by the NDMI values can be confirmed by a significantly lower than average NDVI.
+
+
+# calculate pre and post NDMI in W. RMNP (not just picos)
+```{r}
+#####################
+# calculate dNDMI
+pre_ndmi <- (pre$NIR - pre$SWIR1)/(pre$NIR + pre$SWIR1)
+post_ndmi <- (post$NIR - post$SWIR1)/(post$NIR + post$SWIR1)
+dNDMI <- post_ndmi - pre_ndmi
+names(dNDMI) <- "dNDMI"
+  
+# plot dNDMI
+plot(dNDMI, main="dNDMI")
+
+#####################
+# calculate dNDWI
+pre_ndwi <- (pre$green - pre$SWIR1)/(pre$green + pre$SWIR1)
+post_ndwi <- (post$green - post$SWIR1)/(post$green + post$SWIR1)
+dNDWI <- post_ndwi - pre_ndwi
+names(dNDWI) <- "dNDWI"
+  
+# plot dNDWI
+plot(dNDWI, main="dNDWI")
+
+#####################
+# calculate dNDVI
+pre_ndvi <- (pre$NIR - pre$red)/(pre$NIR + pre$red)
+post_ndvi <- (post$NIR - post$red)/(post$NIR + post$red)
+dNDVI <- post_ndvi - pre_ndvi
+names(dNDVI) <- "dNDVI"
+  
+# plot dNDVI
+plot(dNDVI, main="dNDVI")
+
+#####################
+# calculate simple index
+pre_vi <- pre$SWIR1/pre$NIR
+post_vi <- post$SWIR1/post$NIR
+dVI <- post_vi - pre_vi
+names(dVI) <- "dVI"
+  
+# plot dVI
+plot(dVI, main="dVI")
+
+#####################
+# calculate dVARI
+pre_vari <- (pre$green-pre$red)/(pre$green + pre$red - pre$blue )
+post_vari <- (post$green-post$red)/(post$green + post$red - post$blue )
+dVARI <- post_vari - pre_vari
+names(dVARI) <- "dVARI"
+
+#####################
+# calculate dTCBRI
+pre_tcbri <-  (0.2043*pre$blue) + (0.4158*pre$green ) +(0.5524*pre$red) + (0.5741*pre$NIR) + (0.3124*pre$SWIR1) + (0.2303*pre$SWIR2)
+post_tcbri <-  (0.2043*post$blue) + (0.4158*post$green ) +(0.5524*post$red) + (0.5741*post$NIR) + (0.3124*post$SWIR1) + (0.2303*post$SWIR2)
+dTCBRI<- post_tcbri - pre_tcbri
+names(dTCBRI) <- "dTCBRI"
+
+
+#####################
+# calculate dTCGRE
+pre_tcgre <-  (-0.1603*pre$blue) + (-0.2819*pre$green ) +(0.4934*pre$red) + (0.7940*pre$NIR) + (-0.0002*pre$SWIR1) + (-0.1446*pre$SWIR2)
+post_tcgre <-  (-0.1603*post$blue) + (-0.2819*post$green ) +(0.4934*post$red) + (0.7940*post$NIR) + (-0.0002*post$SWIR1) + (-0.1446*post$SWIR2)
+dTCGRE <- post_tcgre - pre_tcgre
+names(dTCGRE) <- "dTCGRE"
+
+#####################
+# calculate dTCWET
+pre_tcwet <-  (0.0315*pre$blue) + (0.2021*pre$green ) +(0.3102*pre$red) + (0.1594*pre$NIR) + (-0.6806*pre$SWIR1) + (-0.6109*pre$SWIR2)
+post_tcwet <-  (0.0315*post$blue) + (0.2021*post$green ) +(0.3102*post$red) + (0.1594*post$NIR) + (-0.6806*post$SWIR1) + (-0.6109*post$SWIR2)
+dTCWET <- post_tcwet - pre_tcwet
+names(dTCWET) <- "dTCWET"
+
+
+
+dRED <- post$red - pre$red
+names(dRED) <- "dRED"
+dGREEN <- post$green - pre$green
+names(dGREEN) <- "dGREEN"
+dBLUE <- post$blue - pre$blue
+names(dBLUE) <- "dBLUE"
+dNIR <- post$NIR - pre$NIR
+names(dNIR) <- "dNIR"
+dSWIR1 <- post$SWIR1 - pre$SWIR1
+names(dSWIR1) <- "dSWIR1"
+dSWIR2 <- post$SWIR2 - pre$SWIR2
+names(dSWIR2) <- "dSWIR2"
+
+#####################
+
+# convert field points to spatvector
+df_vect <- vect(df_sf)
+
+# bilinear: use 4 nearest raster cells
+dVIs <-
+  terra::extract(dNDMI, df_vect, method="bilinear") %>% 
+  inner_join(terra::extract(dNDWI, df_vect, method="bilinear")) %>% 
+  inner_join(terra::extract(dNDVI, df_vect, method="bilinear")) %>% 
+  inner_join(terra::extract(dVI, df_vect, method="bilinear")) %>% 
+  inner_join(terra::extract(dVARI, df_vect, method="bilinear")) %>%
+  inner_join(terra::extract(dTCBRI, df_vect, method="bilinear")) %>%
+  inner_join(terra::extract(dTCGRE, df_vect, method="bilinear")) %>%
+  inner_join(terra::extract(dTCWET, df_vect, method="bilinear"))
+  #inner_join(terra::extract(dRED, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(dGREEN, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(dBLUE, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(dNIR, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(dSWIR1, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(dSWIR2, df_vect, method="bilinear")) %>%
+  #inner_join(terra::extract(post$blue, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(post$green, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(post$red, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(post$NIR, df_vect, method="bilinear")) %>% 
+  #inner_join(terra::extract(post$SWIR1, df_vect, method="bilinear")) %>%
+  #inner_join(terra::extract(post$SWIR2, df_vect, method="bilinear"))  %>%
+ 
+
+
+```
+
+Compare other dVIs: VARI, NDVI, NDWI. Plot against dNDMI to check for correlation
+```{r}
+# hmm they're all pretty correlated
+p1 <- ggplot(dVIs)+geom_point(aes(x=dVI, y=dNDWI))
+p2 <- ggplot(dVIs)+geom_point(aes(x=dVI, y=dNDVI))
+p3 <- ggplot(dVIs)+geom_point(aes(x=dNDVI, y=dNDWI))
+plot_grid(p1, p2, p3)
+
+ggplot(dVIs)+geom_point(aes(x=dNDVI, y=dNDMI))
+
+
+```
+
+Classify with RF (xgboost is better) 
+```{r}
+
+# extract spectral reflectance for each field point
+dVI_points <- 
+  bind_cols(dVIs, df) %>%
+  inner_join(num_cat_xwalk, by = 'dead_or_mpb_ba_percent') %>%
+  select(mpb_severity, dNDMI:dTCWET, Elevation) %>% 
+  mutate(mpb_severity = factor(mpb_severity, levels=c("high","med","low"))) %>%
+  filter_all(all_vars(.!="NaN")) %>% 
+  group_by(mpb_severity) %>%
+  mutate(mpb_severity = factor(mpb_severity, levels=c("low", "med", "high"))) %>% 
+  filter(!is.na(Elevation)) %>%
+  data.frame()
+
+
+ggplot(dVI_points) + geom_boxplot(aes(x=dNDMI, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dNDWI, y=mpb_severity))  # 
+ggplot(dVI_points) + geom_boxplot(aes(x=dNDVI, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dVI, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dRED, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dGREEN, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dBLUE, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dNIR, y=mpb_severity))   #
+ggplot(dVI_points) + geom_boxplot(aes(x=dSWIR1, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dSWIR2, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=blue, y=mpb_severity))  
+ggplot(dVI_points) + geom_boxplot(aes(x=green, y=mpb_severity))  
+ggplot(dVI_points) + geom_boxplot(aes(x=red, y=mpb_severity))  
+ggplot(dVI_points) + geom_boxplot(aes(x=NIR, y=mpb_severity))  
+ggplot(dVI_points) + geom_boxplot(aes(x=SWIR1, y=mpb_severity))  
+ggplot(dVI_points) + geom_boxplot(aes(x=SWIR2, y=mpb_severity))  #
+ggplot(dVI_points) + geom_boxplot(aes(x=Elevation, y=mpb_severity)) #
+ggplot(dVI_points) + geom_boxplot(aes(x=dTCWET, y=mpb_severity)) ##
+ggplot(dVI_points) + geom_boxplot(aes(x=dTCBRI, y=mpb_severity)) 
+ggplot(dVI_points) + geom_boxplot(aes(x=dTCGRE, y=mpb_severity)) 
+
+
+
+
+```
+
+```{r}
+###### Numeric Regression ###### 
+
+# extract spectral reflectance for each field point - numeric style
+dVI_points_num <- 
+  bind_cols(dVIs, df) %>%
+  select(dead_or_mpb_ba_percent, dNDMI:dvari, Elevation) %>% 
+  filter_all(all_vars(.!="NaN")) %>% 
+  filter(!is.na(Elevation)) %>%
+  data.frame()
+
+# plot y vs VI
+ggplot(dVI_points_num) +
+  geom_point(aes(x=dead_or_mpb_ba_percent, y=dNDMI)) +
+  labs(x="% BA dead")
+
+# correlation matrix
+dVI_points_mat <- as.matrix(dVI_points_num)
+library(Hmisc)
+rcorr <- rcorr(dVI_points_mat) 
+y_rcorr <- rcorr$r["dead_or_mpb_ba_percent", ] %>% round(2)
+print(y_rcorr)
+
+# split training/testing data
+train <- sample_frac(dVI_points_num, 0.7, replace = FALSE)
+test <- setdiff(dVI_points_num, train) %>% data.frame()
+
+set.seed(10)
+
+# build RF model
+mod <- randomForest(dead_or_mpb_ba_percent ~ .,
+                    data = train,
+                    importance=TRUE, 
+                    ntree=200,
+                    mtry=5)
+
+mod
+
+# regression
+lm(dead_or_mpb_ba_percent ~ ., data=dVI_points_num) %>% summary()
+
+```
+
+```{r}
+# split training/testing data
+train <- sample_frac(dVI_points, 0.7, replace = FALSE)
+test <- setdiff(dVI_points, train) %>% data.frame()
+
+set.seed(300)
+
+# build RF model
+mod <- randomForest(mpb_severity ~ .,
+                    data = train,
+                    importance=TRUE, 
+                    ntree=200,
+                    mtry=5)
+
+mod
+
+# CHECK ERROR CONVERGENCE
+plot(mod)
+
+# PLOT mean decrease in accuracy VARIABLE IMPORTANCE
+# expresses how much accuracy (GINI coeff) the model losses by excluding each var
+varImpPlot(mod, type=1)
+```
+
+
+```{r}
+# focused model
+mod <- randomForest(mpb_severity ~ dNDMI,
+                    data = train,
+                    importance=TRUE, 
+                    ntree=100)
+mod
+
+# testing accuracy
+pred <- predict(mod, test)
+forCF <- data.frame(ref=test$mpb_severity, pred=pred)
+conf_mat(forCF, ref, pred)
+summary(conf_mat(forCF, ref, pred))
+
+```
+
+```{r}
+# map predictions
+library(tmap)
+
+pre_pico_ndmi <- (pre_pico$NIR - pre_pico$SWIR1)/(pre_pico$NIR + pre_pico$SWIR1)
+post_pico_ndmi <- (post_pico$NIR - post_pico$SWIR1)/(post_pico$NIR + post_pico$SWIR1)
+dNDMI_pico <- post_pico_ndmi - pre_pico_ndmi
+names(dNDMI_pico) <- "dNDMI"
+plot(dNDMI_pico) 
+
+
+rastPred <- terra::predict(object=dNDMI_pico, model=mod)
+
+tm_shape(rastPred) +
+  tm_raster(style= "cat",title="Land Cover")
+
+f <- freq(rastPred)
+f$area <- f$count * 30^2/1000^2 
+f$percent = round(100 * f$area / sum(f$area), 1)
+f
+```
+
+
+```{r}
+p_nirswir_pre <- ggplot(pre_points) + geom_point(aes(x=SWIR1, y=NIR, color=mpb_severity)) + labs(title="Pre")
+p_nirswir_post <- ggplot(post_points) + geom_point(aes(x=SWIR1, y=NIR, color=mpb_severity)) + labs(title="Post")
+
+plot_grid(p_nirswir_post, p_nirswir_pre)
+
+```
